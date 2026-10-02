@@ -1,7 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
@@ -18,6 +22,13 @@ namespace TGConfigEditor
     BackgroundWorker worker = new BackgroundWorker();
     string fileName = "";
     int lineCount = 0;
+    Encoding configEncoding = new UTF8Encoding(false);
+
+    sealed class ConfigLoadResult
+    {
+      public List<ConfigSection> Sections { get; set; }
+      public Encoding Encoding { get; set; }
+    }
 
     public MainForm()
     {
@@ -27,13 +38,44 @@ namespace TGConfigEditor
       worker.ProgressChanged += worker_ProgressChanged;
       worker.RunWorkerCompleted += worker_RunWorkerCompleted;
       InitializeComponent();
+      CommentsTxtBx.ReadOnly = true;
+      UpdateWindowTitle();
+    }
+
+    void UpdateWindowTitle()
+    {
+      Version version = Assembly.GetExecutingAssembly().GetName().Version;
+      string versionText = version.Major + "." + version.Minor;
+      string fileText = String.IsNullOrWhiteSpace(fileName) ? "" : " - " + fileName;
+      Text = "Transport Giant - Config editor v" + versionText + fileText;
     }
 
     void worker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
     {
+      if (e.Cancelled)
+        return;
+
+      if (e.Error != null)
+      {
+        SaveConfigBtn.Enabled = false;
+        MessageBox.Show("The configuration could not be loaded.\n\n" + e.Error.Message,
+          "Load error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
+      ConfigLoadResult loadResult = e.Result as ConfigLoadResult;
+      if (loadResult == null)
+      {
+        SaveConfigBtn.Enabled = false;
+        MessageBox.Show("The configuration could not be loaded.", "Load error",
+          MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
       Properties.Settings.Default.LastConfigFile = fileName;
       Properties.Settings.Default.Save();
-      configSections = (List<ConfigSection>)e.Result;
+      configSections = loadResult.Sections;
+      configEncoding = loadResult.Encoding;
 
       foreach (ConfigSection section in configSections)
       {
@@ -61,33 +103,47 @@ namespace TGConfigEditor
 
       if (File.Exists(wFileName))
       {
-        StreamReader configFile = new StreamReader(wFileName);
-        ConfigSection section = null;
-        Regex regex = new Regex("^([a-z]|[A-Z]|[_]){3,64}");
-        Match result = null;
-
-        while (configFile.Peek() != -1)
+        Encoding detectedEncoding = DetectFileEncoding(wFileName);
+        using (StreamReader configFile = new StreamReader(wFileName, detectedEncoding, true))
         {
-          line = configFile.ReadLine();
-          currentLine++;
-          result = regex.Match(line);
+          ConfigSection section = null;
+          Regex regex = new Regex(@"^([A-Za-z_][A-Za-z0-9_]{2,63})\b");
+          Match result = null;
 
-          if (result.Success)
+          while (configFile.Peek() != -1)
           {
-            section = new ConfigSection();
-            section.Name = result.Value;
-            section.RawLines.Add(line);
-            section.IsSupported = Helper.IsSectionSupported(section);
-            section.IsMasterTable = Helper.IsSectionMasterTable(section);
-            configSectionsTemp.Add(section);
-            worker.ReportProgress(currentLine);
+            line = configFile.ReadLine();
+            currentLine++;
+            result = regex.Match(line);
+
+            if (result.Success)
+            {
+              section = new ConfigSection();
+              section.Name = result.Groups[1].Value;
+              section.RawLines.Add(line);
+              section.IsSupported = Helper.IsSectionSupported(section);
+              section.IsMasterTable = Helper.IsSectionMasterTable(section);
+              configSectionsTemp.Add(section);
+              worker.ReportProgress(currentLine);
+            }
+            else if (section != null)
+            {
+              section.RawLines.Add(line);
+            }
+            else
+            {
+              section = new ConfigSection();
+              section.Name = String.Empty;
+              section.RawLines.Add(line);
+              configSectionsTemp.Add(section);
+            }
           }
-          else
-          {
-            section.RawLines.Add(line);
-          }
+
+          if (configFile.CurrentEncoding != null)
+            detectedEncoding = configFile.CurrentEncoding;
+
+          configEncoding = detectedEncoding;
         }
-        configFile.Close();
       }
 
       line = "";
@@ -108,8 +164,7 @@ namespace TGConfigEditor
               line = section.RawLines[i];
               if (string.IsNullOrWhiteSpace(line.Trim()) == false)
               {
-                line = line.Replace("\t", " ");
-                lineSplit = line.Split(' ');
+                lineSplit = Regex.Split(line.Trim(), @"\s+");
                 CommonTable table = new CommonTable();
                 table.ItemId = lineSplit[0];
                 table.RowsCount = Convert.ToInt32(lineSplit[1]);
@@ -121,9 +176,7 @@ namespace TGConfigEditor
                   line = section.RawLines[i].Trim();
                   TableRow row = new TableRow();
                   row.ItemId = table.ItemId;
-                  line = line.Replace("\t", " ");
-                  line = Helper.ClearDoubleSpaces(line);
-                  lineSplit = line.Split(' ');
+                  lineSplit = Regex.Split(line, @"\s+");
 
                   for (int r = 0; r < lineSplit.Length; r++)
                     row.Values.Add(lineSplit[r]);
@@ -156,7 +209,7 @@ namespace TGConfigEditor
 
             for (int j = 4; j < section.RawLines.Count; j++)
             {
-              line = Helper.NormalizeLine(section.RawLines[j]);
+              line = section.RawLines[j].Trim();
               if (string.IsNullOrWhiteSpace(line.Trim()) == false)
               {
                 lineSplit = line.Split('\t');
@@ -180,7 +233,34 @@ namespace TGConfigEditor
         worker.ReportProgress(currentLine);
       }
 
-      e.Result = configSectionsTemp;
+      e.Result = new ConfigLoadResult
+      {
+        Sections = configSectionsTemp,
+        Encoding = configEncoding
+      };
+    }
+
+    static Encoding DetectFileEncoding(string path)
+    {
+      byte[] bytes = File.ReadAllBytes(path);
+
+      if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        return new UTF8Encoding(true);
+      if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        return new UnicodeEncoding(false, true);
+      if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        return new UnicodeEncoding(true, true);
+
+      try
+      {
+        new UTF8Encoding(false, true).GetString(bytes);
+        return new UTF8Encoding(false);
+      }
+      catch (DecoderFallbackException)
+      {
+        return Encoding.GetEncoding(1252, EncoderFallback.ExceptionFallback,
+          DecoderFallback.ExceptionFallback);
+      }
     }
 
     private void LoadConfigBtn_Click(object sender, EventArgs e)
@@ -222,7 +302,7 @@ namespace TGConfigEditor
         supportedConfigSections.Clear();
 
         worker.RunWorkerAsync(fileName);
-        this.Text = "Transport Giant - Config editor v0.5 - " + fileName;
+        UpdateWindowTitle();
       }
     }
 
@@ -235,14 +315,17 @@ namespace TGConfigEditor
     private void DataGridSection_CellEndEdit(object sender, DataGridViewCellEventArgs e)
     {
       object newValue = DataGridSection.Rows[e.RowIndex].Cells[e.ColumnIndex].Value;
-      UpdateSourceData(newValue, e.RowIndex, e.ColumnIndex);
+      if (newValue != null)
+        UpdateSourceData(newValue, e.RowIndex, e.ColumnIndex);
     }
 
     private void UpdateSourceData(object newValue, int rowIndex, int columnIndex)
     {
-      if (TreeViewSection.SelectedNode != null)
+      if (TreeViewSection.SelectedNode != null && newValue != null)
       {
-        ConfigSection section = GetConfigSection(TreeViewSection.SelectedNode.Text);
+        ConfigSection section = GetConfigSection(selectedSectionName);
+        if (section == null)
+          return;
 
         if (section.IsMasterTable)
         {
@@ -259,65 +342,326 @@ namespace TGConfigEditor
 
     private void SaveConfigBtn_Click(object sender, EventArgs e)
     {
+      List<string> errors;
+      List<string> warnings;
+      ValidateConfig(out errors, out warnings);
+
+      if (errors.Count > 0)
+      {
+        MessageBox.Show("The configuration contains errors and cannot be saved:\n\n" +
+          String.Join("\n", errors.Take(20)), "Validation error",
+          MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
+      if (warnings.Count > 0)
+      {
+        DialogResult warningResult = MessageBox.Show(
+          "The configuration contains possible inconsistencies:\n\n" +
+          String.Join("\n", warnings.Take(20)) +
+          "\n\nSave anyway?",
+          "Validation warning", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+        if (warningResult != DialogResult.Yes)
+          return;
+      }
+
       if (SaveConfigFileDlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
       {
-        string line = "";
-        using (var reader = File.CreateText(SaveConfigFileDlg.FileName))
+        try
         {
-          foreach (ConfigSection section in configSections)
+          WriteConfigFile(SaveConfigFileDlg.FileName);
+          MessageBox.Show("Configuration saved successfully.", "Save complete",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+          MessageBox.Show("The configuration could not be saved.\n\n" + ex.Message,
+            "Save error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+      }
+    }
+
+    void WriteConfigFile(string outputFileName)
+    {
+      string fullOutputPath = Path.GetFullPath(outputFileName);
+      string outputDirectory = Path.GetDirectoryName(fullOutputPath);
+      string temporaryFile = Path.Combine(outputDirectory,
+        "." + Path.GetFileName(fullOutputPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+
+      try
+      {
+        WriteConfigContent(temporaryFile);
+        if (File.Exists(fullOutputPath))
+          File.Replace(temporaryFile, fullOutputPath, null, true);
+        else
+          File.Move(temporaryFile, fullOutputPath);
+      }
+      finally
+      {
+        if (File.Exists(temporaryFile))
+          File.Delete(temporaryFile);
+      }
+    }
+
+    void WriteConfigContent(string outputFileName)
+    {
+      string line = "";
+      using (StreamWriter writer = new StreamWriter(outputFileName, false, configEncoding))
+      {
+        foreach (ConfigSection section in configSections)
+        {
+          if (section.IsSupported)
           {
-            if (section.IsSupported)
+            if (section.IsMasterTable)
             {
-              if (section.IsMasterTable)
-              {
-                reader.WriteLine(section.RawLines[0]);
-                reader.WriteLine(section.RawLines[1]);
-                reader.WriteLine("	" + section.MasterTable.TableComment);
+              writer.WriteLine(section.RawLines[0]);
+              writer.WriteLine(section.RawLines[1]);
+              writer.WriteLine("\t" + section.MasterTable.TableComment);
 
-                foreach (CommonTable table in section.MasterTable.CommonTables)
-                {
-                  line = table.ItemId + "\t" + table.RowsCount + "\t" + table.ColumnsCount;
-                  reader.WriteLine(line);
-                  foreach (TableRow row in table.Rows)
-                  {
-                    line = "";
-                    foreach (string value in row.Values)
-                    {
-                      line += "\t" + value;
-                    }
-                    reader.WriteLine(line.Trim());
-                  }
-                  reader.WriteLine();
-                }
-              }
-              else
+              foreach (CommonTable table in section.MasterTable.CommonTables)
               {
-                reader.WriteLine(section.RawLines[0]);
-                reader.WriteLine(section.RawLines[1]);
-                reader.WriteLine(section.RawLines[2]);
-                reader.WriteLine(section.RawLines[3]);
-                reader.WriteLine();
-
-                foreach (TableRow row in section.CommonTable.Rows)
+                line = table.ItemId + "\t" + table.RowsCount + "\t" + table.ColumnsCount;
+                writer.WriteLine(line);
+                foreach (TableRow row in table.Rows)
                 {
-                  line = "";
-                  foreach (string value in row.Values)
-                  {
-                    line += "                            \t" + value;
-                  }
-                  reader.WriteLine(line);
+                  writer.WriteLine(String.Join("\t", row.Values));
                 }
-                reader.WriteLine();
+                writer.WriteLine();
               }
             }
             else
             {
-              foreach (string item in section.RawLines)
-                reader.WriteLine(item);
+              writer.WriteLine(section.RawLines[0]);
+              writer.WriteLine(section.RawLines[1]);
+              writer.WriteLine(section.RawLines[2]);
+              writer.WriteLine(section.RawLines[3]);
+              writer.WriteLine();
+
+              foreach (TableRow row in section.CommonTable.Rows)
+              {
+                writer.Write("                            \t");
+                writer.WriteLine(String.Join("                            \t", row.Values));
+              }
+              writer.WriteLine();
+            }
+          }
+          else
+          {
+            foreach (string item in section.RawLines)
+              writer.WriteLine(item);
+          }
+        }
+      }
+    }
+
+    void ValidateConfig(out List<string> errors, out List<string> warnings)
+    {
+      errors = new List<string>();
+      warnings = new List<string>();
+
+      foreach (ConfigSection section in supportedConfigSections)
+      {
+        if (section.IsMasterTable)
+        {
+          if (section.MasterTable == null)
+          {
+            errors.Add(section.Name + ": missing master table.");
+            continue;
+          }
+
+          foreach (CommonTable table in section.MasterTable.CommonTables)
+          {
+            if (table.RowsCount != table.Rows.Count)
+              errors.Add(section.Name + "[" + table.ItemId + "]: row count does not match the data.");
+
+            foreach (TableRow row in table.Rows)
+            {
+              if (row.Values.Count != table.ColumnsCount)
+                errors.Add(section.Name + "[" + table.ItemId + "]: expected " +
+                  table.ColumnsCount + " values, found " + row.Values.Count + ".");
+            }
+          }
+        }
+        else
+        {
+          if (section.CommonTable == null)
+          {
+            errors.Add(section.Name + ": missing table.");
+            continue;
+          }
+
+          if (section.CommonTable.RowsCount != section.CommonTable.Rows.Count)
+            errors.Add(section.Name + ": row count does not match the data.");
+
+          foreach (TableRow row in section.CommonTable.Rows)
+          {
+            if (row.Values.Count != section.CommonTable.ColumnsCount)
+              errors.Add(section.Name + "[" + row.ItemId + "]: expected " +
+                section.CommonTable.ColumnsCount + " values, found " + row.Values.Count + ".");
+            else if (row.Values.Count > 0 && row.ItemId != row.Values[0])
+              errors.Add(section.Name + "[" + row.ItemId + "]: item ID was changed inconsistently.");
+          }
+        }
+      }
+
+      ConfigSection factorySection = GetConfigSection("Factory");
+      ConfigSection productSection = GetConfigSection("Product");
+      if (factorySection == null || factorySection.CommonTable == null ||
+          productSection == null || productSection.CommonTable == null)
+        return;
+
+      HashSet<string> factoryIds = new HashSet<string>(
+        factorySection.CommonTable.Rows.Select(row => row.ItemId));
+      HashSet<string> productIds = new HashSet<string>(
+        productSection.CommonTable.Rows.Select(row => row.ItemId));
+
+      ValidateProductMasterTable("AcceptProduct", factoryIds, productIds, false, errors, warnings);
+      ValidateProductMasterTable("BuildingResources", factoryIds, productIds, false, errors, warnings);
+      ValidateProductMasterTable("ProduceProduct", factoryIds, productIds, true, errors, warnings);
+      ValidateMembers(factoryIds, errors, warnings);
+      ValidateProductionLinks(factorySection, productSection, productIds, warnings);
+    }
+
+    void ValidateProductMasterTable(string sectionName, HashSet<string> factoryIds,
+      HashSet<string> productIds, bool validateProductionValues, List<string> errors,
+      List<string> warnings)
+    {
+      ConfigSection section = GetConfigSection(sectionName);
+      if (section == null || section.MasterTable == null)
+        return;
+
+      foreach (CommonTable table in section.MasterTable.CommonTables)
+      {
+        if (!factoryIds.Contains(table.ItemId))
+          errors.Add(sectionName + ": unknown factory ID " + table.ItemId + ".");
+
+        HashSet<string> seenProducts = new HashSet<string>();
+        foreach (TableRow row in table.Rows)
+        {
+          if (row.Values.Count == 0)
+            continue;
+
+          string productId = row.Values[0];
+          if (!productIds.Contains(productId))
+            errors.Add(sectionName + "[" + table.ItemId + "]: unknown product ID " + productId + ".");
+          if (!seenProducts.Add(productId))
+            warnings.Add(sectionName + "[" + table.ItemId + "]: duplicate product ID " + productId + ".");
+
+          if (validateProductionValues && row.Values.Count == 4)
+          {
+            double minimum;
+            double maximum;
+            double resourcesLeft;
+            if (!TryParseConfigNumber(row.Values[1], out minimum) ||
+                !TryParseConfigNumber(row.Values[2], out maximum) ||
+                !TryParseConfigNumber(row.Values[3], out resourcesLeft))
+            {
+              errors.Add(sectionName + "[" + table.ItemId + "]: invalid numeric production value.");
+            }
+            else if (minimum > maximum)
+            {
+              errors.Add(sectionName + "[" + table.ItemId + "]: minimum production is greater than maximum.");
             }
           }
         }
       }
+    }
+
+    void ValidateMembers(HashSet<string> factoryIds, List<string> errors, List<string> warnings)
+    {
+      ConfigSection members = GetConfigSection("Members");
+      if (members == null || members.MasterTable == null)
+        return;
+
+      foreach (CommonTable table in members.MasterTable.CommonTables)
+      {
+        HashSet<string> seenFactories = new HashSet<string>();
+        foreach (TableRow row in table.Rows)
+        {
+          if (row.Values.Count == 0)
+            continue;
+          string factoryId = row.Values[0];
+          if (!factoryIds.Contains(factoryId))
+            errors.Add("Members[" + table.ItemId + "]: unknown factory ID " + factoryId + ".");
+          if (!seenFactories.Add(factoryId))
+            warnings.Add("Members[" + table.ItemId + "]: duplicate factory ID " + factoryId + ".");
+        }
+      }
+    }
+
+    void ValidateProductionLinks(ConfigSection factorySection, ConfigSection productSection,
+      HashSet<string> productIds, List<string> warnings)
+    {
+      ConfigSection accepts = GetConfigSection("AcceptProduct");
+      ConfigSection produces = GetConfigSection("ProduceProduct");
+      if (accepts == null || accepts.MasterTable == null ||
+          produces == null || produces.MasterTable == null)
+        return;
+
+      int resourceNeededIndex = productSection.CommonTable.GetHeaderIndex("ResourceNeeded");
+      int factoryIdIndex = productSection.CommonTable.GetHeaderIndex("FactoryID");
+      if (resourceNeededIndex < 0 || factoryIdIndex < 0)
+        return;
+
+      Dictionary<string, TableRow> products = productSection.CommonTable.Rows
+        .ToDictionary(row => row.ItemId);
+      HashSet<string> factoryIds = new HashSet<string>(
+        factorySection.CommonTable.Rows.Select(row => row.ItemId));
+
+      foreach (CommonTable productionTable in produces.MasterTable.CommonTables)
+      {
+        CommonTable acceptedTable = accepts.MasterTable.GetTable(productionTable.ItemId);
+        HashSet<string> acceptedProducts = acceptedTable == null
+          ? new HashSet<string>()
+          : new HashSet<string>(acceptedTable.Rows.Where(row => row.Values.Count > 0)
+              .Select(row => row.Values[0]));
+
+        foreach (TableRow productionRow in productionTable.Rows)
+        {
+          if (productionRow.Values.Count == 0 || !products.ContainsKey(productionRow.Values[0]))
+            continue;
+
+          TableRow product = products[productionRow.Values[0]];
+          string resourceNeeded = product.Values[resourceNeededIndex];
+          if (resourceNeeded != "-1" && productIds.Contains(resourceNeeded) &&
+              !acceptedProducts.Contains(resourceNeeded))
+          {
+            warnings.Add("Factory " + productionTable.ItemId + " produces product " +
+              productionRow.Values[0] + " requiring product " + resourceNeeded +
+              ", but does not accept it.");
+          }
+        }
+      }
+
+      foreach (TableRow product in productSection.CommonTable.Rows)
+      {
+        string primaryFactoryId = product.Values[factoryIdIndex];
+        string resourceNeeded = product.Values[resourceNeededIndex];
+        if (resourceNeeded != "-1" && !productIds.Contains(resourceNeeded))
+          warnings.Add("Product " + product.ItemId + " requires unknown product " +
+            resourceNeeded + ".");
+
+        if (!factoryIds.Contains(primaryFactoryId))
+        {
+          warnings.Add("Product " + product.ItemId + " points to unknown factory " +
+            primaryFactoryId + ".");
+          continue;
+        }
+
+        CommonTable primaryFactoryProduction = produces.MasterTable.GetTable(primaryFactoryId);
+        if (primaryFactoryProduction == null || !primaryFactoryProduction.Rows.Any(row =>
+              row.Values.Count > 0 && row.Values[0] == product.ItemId))
+        {
+          warnings.Add("Product " + product.ItemId + " points to factory " + primaryFactoryId +
+            ", but that factory does not produce it.");
+        }
+      }
+    }
+
+    static bool TryParseConfigNumber(string value, out double result)
+    {
+      return Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out result) ||
+        Double.TryParse(value, NumberStyles.Float, CultureInfo.CurrentCulture, out result);
     }
 
     private void TreeViewSection_AfterSelect(object sender, TreeViewEventArgs e)
@@ -596,6 +940,15 @@ namespace TGConfigEditor
         int selectedIndex = AllItemsCmbBx.SelectedIndex;
         TableRow newRow = new TableRow();
         string itemIdValue = ((ComboBoxItem)AllItemsCmbBx.SelectedItem).Value;
+
+        if (selectedCommonTable.Rows.Any(row => row.Values.Count > 0 &&
+            row.Values[0] == itemIdValue))
+        {
+          MessageBox.Show("This item is already present in the selected table.",
+            "Duplicate item", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+          return;
+        }
+
         newRow.ItemId = selectedCommonTable.ItemId;
         newRow.Values.Add(itemIdValue);
 
@@ -620,7 +973,8 @@ namespace TGConfigEditor
 
     private void TableItemsGrid_CellEndEdit(object sender, DataGridViewCellEventArgs e)
     {
-      if (selectedCommonTable != null)
+      if (selectedCommonTable != null && e.ColumnIndex > 0 &&
+          TableItemsGrid.Rows[e.RowIndex].Cells[e.ColumnIndex].Value != null)
       {
         selectedCommonTable.Rows[e.RowIndex].Values[e.ColumnIndex - 1] = TableItemsGrid.Rows[e.RowIndex].Cells[e.ColumnIndex].Value.ToString();
         refreshRequired = false;
@@ -674,231 +1028,208 @@ namespace TGConfigEditor
 
     private void TranslateBtn_Click(object sender, EventArgs e)
     {
-      //string test = "";
-      //int i = 0;
-      //foreach (var item in supportedConfigSections[14].CommonTable.Rows)
-      //{
-      //  test += "supportedConfigSections[14].CommonTable.Rows[" + i + "].Values[18] = \"" + item.Values[18].Replace("\"", "\\\"") + "\";\n";
-      //  i++;
-      //}
+      ConfigSection factorySection = GetConfigSection("Factory");
+      ConfigSection productSection = GetConfigSection("Product");
 
-      if (supportedConfigSections != null && supportedConfigSections.Count > 0)
+      string[] factoryIds =
       {
-        supportedConfigSections[1].CommonTable.Rows[0].Values[15] = "\"Iron ore mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[1].Values[15] = "\"Copper mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[2].Values[15] = "\"Gold mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[3].Values[15] = "\"Bauxit mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[4].Values[15] = "\"Coal mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[5].Values[15] = "\"Uranium mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[6].Values[15] = "\"Oil well\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[7].Values[15] = "\"Lumber camp\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[8].Values[15] = "\"Salt mine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[9].Values[15] = "\"Gravel pit\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[10].Values[15] = "\"Quarry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[11].Values[15] = "\"Waterworks\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[12].Values[15] = "\"Orchard\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[13].Values[15] = "\"Coffee plantation\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[14].Values[15] = "\"Sugar plantation\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[15].Values[15] = "\"Hop farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[16].Values[15] = "\"Olive grove\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[17].Values[15] = "\"Tobacco plantation\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[18].Values[15] = "\"Cotton Plantation\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[19].Values[15] = "\"Crop Farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[20].Values[15] = "\"Sheep farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[21].Values[15] = "\"Pig farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[22].Values[15] = "\"Cattle farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[23].Values[15] = "\"Chicken farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[24].Values[15] = "\"Distillery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[25].Values[15] = "\"Steel Mill\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[26].Values[15] = "\"Sawmill\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[27].Values[15] = "\"Paper mill\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[28].Values[15] = "\"Foundry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[29].Values[15] = "\"Aluminum smelter\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[30].Values[15] = "\"Jeweler\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[31].Values[15] = "\"Refinery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[32].Values[15] = "\"Lab\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[33].Values[15] = "\"Cement factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[34].Values[15] = "\"Brickyard\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[35].Values[15] = "\"Ice factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[36].Values[15] = "\"Fish farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[37].Values[15] = "\"Coffee roastery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[38].Values[15] = "\"Liquor factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[39].Values[15] = "\"Brewery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[40].Values[15] = "\"Oil mill\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[41].Values[15] = "\"Tobacco factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[42].Values[15] = "\"Textile industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[43].Values[15] = "\"Slaughterhouse\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[44].Values[15] = "\"Dairy\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[45].Values[15] = "\"Food factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[46].Values[15] = "\"Tool factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[47].Values[15] = "\"Building materials industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[48].Values[15] = "\"Furniture factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[49].Values[15] = "\"Carpentry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[50].Values[15] = "\"Printing house\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[51].Values[15] = "\"Household goods factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[52].Values[15] = "\"Electronics industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[53].Values[15] = "\"Paint factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[54].Values[15] = "\"Fertilizer plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[55].Values[15] = "\"Oil power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[56].Values[15] = "\"Coal plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[57].Values[15] = "\"Nuclear power station\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[58].Values[15] = "\"Trash dump\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[59].Values[15] = "\"Trash incinerator\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[60].Values[15] = "\"Crocodile farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[61].Values[15] = "\"Ostrich farm\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[62].Values[15] = "\"Winery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[63].Values[15] = "\"Sandpit\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[64].Values[15] = "\"Glassworks\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[65].Values[15] = "\"Solar cell industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[66].Values[15] = "\"Auto industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[67].Values[15] = "\"Brandy-Distillery\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[68].Values[15] = "\"Kangaroo breed\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[69].Values[15] = "\"Shoe factory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[70].Values[15] = "\"Opalmine\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[71].Values[15] = "\"Jewelry industry\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[72].Values[15] = "\"Kiwi plantation\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[73].Values[15] = "\"Atomium\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[74].Values[15] = "\"Observation Tower\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[75].Values[15] = "\"Eiffel Tower\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[76].Values[15] = "\"Statue of Liberty\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[77].Values[15] = "\"Lincoln monument\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[78].Values[15] = "\"Neuschwanstein Castle\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[79].Values[15] = "\"Ferris wheel\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[80].Values[15] = "\"St. Stephen's Cathedral\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[81].Values[15] = "\"Taj Mahal\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[82].Values[15] = "\"The White House\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[83].Values[15] = "\"Akropolis\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[84].Values[15] = "\"Space Museum\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[85].Values[15] = "\"Colossus of Rhodes\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[86].Values[15] = "\"Mount St. Michel\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[87].Values[15] = "\"Pyramide\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[88].Values[15] = "\"Stonehenge\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[89].Values[15] = "\"Triumphal Arch\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[90].Values[15] = "\"Fort\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[91].Values[15] = "\"Space Center\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[92].Values[15] = "\"Space Center\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[93].Values[15] = "\"Space Center\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[94].Values[15] = "\"Space Center\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[95].Values[15] = "\"Botanical Garden\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[96].Values[15] = "\"Sports Stadium\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[97].Values[15] = "\"Olympic Swimming Stadium\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[98].Values[15] = "\"Olympic Games Athletics\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[99].Values[15] = "\"Olympic Football Stadium\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[100].Values[15] = "\"Olympic Fire\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[101].Values[15] = "\"Adventure Casino\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[102].Values[15] = "\"Zoological Garden\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[103].Values[15] = "\"Amusement park\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[104].Values[15] = "\"Observatory\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[105].Values[15] = "\"Biosphere\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[106].Values[15] = "\"Thermenhotel\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[107].Values[15] = "\"Casino\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[108].Values[15] = "\"Radio telescope\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[109].Values[15] = "\"Television tower\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[110].Values[15] = "\"Walking park\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[111].Values[15] = "\"Comic Park\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[112].Values[15] = "\"Opera house\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[113].Values[15] = "\"Supply station\" \"Eine Art von Raststette, bei der Tiere und Menschen versorgt werden kunnen. Gebaut entlang einer langen Strase durch den australischen Kontinent. Im Jahr 1862.\"";
-        supportedConfigSections[1].CommonTable.Rows[114].Values[15] = "\"Funkstation\" \"Eine grose Funkstation - also ein Gebaude!\"";
-        supportedConfigSections[1].CommonTable.Rows[115].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[116].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[117].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[118].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[119].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[120].Values[15] = "\"Fusion power plant\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[121].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[122].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[123].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[124].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[125].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[126].Values[15] = "\"World Exposition grounds\" \"\"";
-        supportedConfigSections[1].CommonTable.Rows[127].Values[15] = "\"City\" \"\"";
+        "1", "2", "3", "4",
+        "5", "6", "7", "8",
+        "9", "10", "11", "12",
+        "13", "14", "15", "16",
+        "17", "18", "19", "20",
+        "21", "22", "23", "24",
+        "25", "26", "27", "28",
+        "29", "30", "31", "32",
+        "33", "34", "35", "36",
+        "37", "38", "39", "40",
+        "41", "42", "43", "44",
+        "45", "46", "47", "48",
+        "49", "50", "51", "52",
+        "53", "54", "55", "56",
+        "57", "58", "59", "60",
+        "61", "62", "63", "64",
+        "65", "66", "67", "68",
+        "69", "70", "71", "72",
+        "73", "100", "101", "102",
+        "103", "104", "105", "106",
+        "107", "108", "109", "110",
+        "111", "112", "113", "114",
+        "115", "116", "117", "118",
+        "119", "120", "121", "122",
+        "123", "124", "125", "126",
+        "127", "128", "129", "130",
+        "131", "132", "133", "134",
+        "135", "136", "137", "138",
+        "139", "140", "141", "142",
+        "143", "144", "145", "146",
+        "147", "148", "149", "150",
+        "151", "152", "153", "999"
+      };
+      string[] factoryNames =
+      {
+        "Iron ore mine", "Copper mine", "Gold mine", "Bauxit mine",
+        "Coal mine", "Uranium mine", "Oil well", "Lumber camp",
+        "Salt mine", "Gravel pit", "Quarry", "Waterworks",
+        "Orchard", "Coffee plantation", "Sugar plantation", "Hop farm",
+        "Olive grove", "Tobacco plantation", "Cotton Plantation", "Crop Farm",
+        "Sheep farm", "Pig farm", "Cattle farm", "Chicken farm",
+        "Distillery", "Steel Mill", "Sawmill", "Paper mill",
+        "Foundry", "Aluminum smelter", "Jeweler", "Refinery",
+        "Lab", "Cement factory", "Brickyard", "Ice factory",
+        "Fish farm", "Coffee roastery", "Liquor factory", "Brewery",
+        "Oil mill", "Tobacco factory", "Textile industry", "Slaughterhouse",
+        "Dairy", "Food factory", "Tool factory", "Building materials industry",
+        "Furniture factory", "Carpentry", "Printing house", "Household goods factory",
+        "Electronics industry", "Paint factory", "Fertilizer plant", "Oil power plant",
+        "Coal plant", "Nuclear power station", "Trash dump", "Trash incinerator",
+        "Crocodile farm", "Ostrich farm", "Winery", "Sandpit",
+        "Glassworks", "Solar cell industry", "Auto industry", "Brandy-Distillery",
+        "Kangaroo breed", "Shoe factory", "Opalmine", "Jewelry industry",
+        "Kiwi plantation", "Atomium", "Observation Tower", "Eiffel Tower",
+        "Statue of Liberty", "Lincoln monument", "Neuschwanstein Castle", "Ferris wheel",
+        "St. Stephen's Cathedral", "Taj Mahal", "The White House", "Akropolis",
+        "Space Museum", "Colossus of Rhodes", "Mount St. Michel", "Pyramide",
+        "Stonehenge", "Triumphal Arch", "Fort", "Space Center",
+        "Space Center", "Space Center", "Space Center", "Botanical Garden",
+        "Sports Stadium", "Olympic Swimming Stadium", "Olympic Games Athletics", "Olympic Football Stadium",
+        "Olympic Fire", "Adventure Casino", "Zoological Garden", "Amusement park",
+        "Observatory", "Biosphere", "Thermenhotel", "Casino",
+        "Radio telescope", "Television tower", "Walking park", "Comic Park",
+        "Opera house", "Supply station", "Funkstation", "Fusion power plant",
+        "Fusion power plant", "Fusion power plant", "Fusion power plant", "Fusion power plant",
+        "Fusion power plant", "World Exposition grounds", "World Exposition grounds", "World Exposition grounds",
+        "World Exposition grounds", "World Exposition grounds", "World Exposition grounds", "City"
+      };
+      string[] productIds =
+      {
+        "1", "2", "3", "4",
+        "5", "6", "7", "8",
+        "9", "10", "11", "12",
+        "13", "14", "15", "16",
+        "17", "18", "19", "20",
+        "21", "22", "23", "24",
+        "25", "26", "27", "28",
+        "29", "30", "31", "32",
+        "33", "34", "35", "36",
+        "37", "38", "39", "40",
+        "41", "42", "43", "44",
+        "45", "46", "47", "48",
+        "49", "50", "51", "52",
+        "53", "54", "55", "56",
+        "61", "62", "63", "64",
+        "65", "66", "67", "68",
+        "69", "70", "71", "998",
+        "999"
+      };
+      string[] productNames =
+      {
+        "Iron ore", "Copper ore", "Gold", "Bauxite",
+        "Coal", "Uranium ore", "Oil", "Logs",
+        "Salt", "Gravel", "Clay", "Water",
+        "Fruit", "Coffee beans", "Sugarcane", "Hop",
+        "Olives", "Tobacco", "Cotton", "Grain",
+        "Wool", "Pigs", "Milk", "Egs",
+        "Whisky", "Steel", "Wooden boards", "Paper",
+        "Copper sheet", "Aluminium", "Jewellery", "Fuels",
+        "Chemicals", "Cement", "Brick", "Blocks of ice",
+        "Fish", "Coffee", "Rum", "Beer",
+        "Olive oil", "Cigars", "Clothes", "Meat",
+        "Cheese", "Foods", "Tool", "Construction materials",
+        "Furniture", "Wooden houses", "Newspapers", "Household goods",
+        "Electric devices", "Colors", "Fertilizer", "Rubbish",
+        "Crocodile skin", "Leather boots", "Wine", "Quartz sand",
+        "Glass", "Solar cells", "Solar car", "Brandy",
+        "Opals", "Kiwis", "Jewellery (opals)", "Passengers",
+        "Mail"
+      };
 
-        supportedConfigSections[14].CommonTable.Rows[0].Values[18] = "\"Iron ore\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[1].Values[18] = "\"Copper ore\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[2].Values[18] = "\"Gold\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[3].Values[18] = "\"Bauxite\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[4].Values[18] = "\"Coal\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[5].Values[18] = "\"Uranium ore\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[6].Values[18] = "\"Oil\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[7].Values[18] = "\"Logs\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[8].Values[18] = "\"Salt\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[9].Values[18] = "\"Gravel\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[10].Values[18] = "\"Clay\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[11].Values[18] = "\"Water\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[12].Values[18] = "\"Fruit\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[13].Values[18] = "\"Coffee beans\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[14].Values[18] = "\"Sugarcane\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[15].Values[18] = "\"Hop\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[16].Values[18] = "\"Olives\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[17].Values[18] = "\"Tobacco\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[18].Values[18] = "\"Cotton\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[19].Values[18] = "\"Grain\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[20].Values[18] = "\"Wool\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[21].Values[18] = "\"Pigs\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[22].Values[18] = "\"Milk\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[23].Values[18] = "\"Egs\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[24].Values[18] = "\"Whisky\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[25].Values[18] = "\"Steel\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[26].Values[18] = "\"Wooden boards\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[27].Values[18] = "\"Paper\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[28].Values[18] = "\"Copper sheet\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[29].Values[18] = "\"Aluminium\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[30].Values[18] = "\"Jewellery\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[31].Values[18] = "\"Fuels\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[32].Values[18] = "\"Chemicals\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[33].Values[18] = "\"Cement\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[34].Values[18] = "\"Brick\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[35].Values[18] = "\"Blocks of ice\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[36].Values[18] = "\"Fish\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[37].Values[18] = "\"Coffee\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[38].Values[18] = "\"Rum\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[39].Values[18] = "\"Beer\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[40].Values[18] = "\"Olive oil\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[41].Values[18] = "\"Cigars\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[42].Values[18] = "\"Clothes\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[43].Values[18] = "\"Meat\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[44].Values[18] = "\"Cheese\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[45].Values[18] = "\"Foods\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[46].Values[18] = "\"Tool\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[47].Values[18] = "\"Construction materials\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[48].Values[18] = "\"Furniture\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[49].Values[18] = "\"Wooden houses\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[50].Values[18] = "\"Newspapers\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[51].Values[18] = "\"Household goods\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[52].Values[18] = "\"Electric devices\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[53].Values[18] = "\"Colors\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[54].Values[18] = "\"Fertilizer\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[55].Values[18] = "\"Rubbish\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[56].Values[18] = "\"Crocodile skin\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[57].Values[18] = "\"Leather boots\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[58].Values[18] = "\"Wine\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[59].Values[18] = "\"Quartz sand\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[60].Values[18] = "\"Glass\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[61].Values[18] = "\"Solar cells\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[62].Values[18] = "\"Solar car\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[63].Values[18] = "\"Brandy\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[64].Values[18] = "\"Opals\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[65].Values[18] = "\"Kiwis\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[66].Values[18] = "\"Jewellery (opals)\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[67].Values[18] = "\"Passengers\" \"\"";
-        supportedConfigSections[14].CommonTable.Rows[68].Values[18] = "\"Mail\" \"\"";
-
-        AllItemsCmbBx.SelectedIndex = -1;
-        DataGridSection.AutoGenerateColumns = false;
-        DataGridSection.ClearSelection();
-        DataGridSection.Rows.Clear();
-        DataGridSection.Columns.Clear();
-
-        DetailsLbl.Text = "N/A";
-
-        TableItemsGrid.ClearSelection();
-        TableItemsGrid.Columns.Clear();
-        TableItemsGrid.Rows.Clear();
-
-        AllItemsCmbBx.Items.Clear();
-        selectedCommonTable = null;
-        TreeViewSection.SelectedNode = null;
+      string validationError;
+      if (!CanApplyNameTranslations(factorySection, factoryIds, factoryNames, out validationError) ||
+          !CanApplyNameTranslations(productSection, productIds, productNames, out validationError))
+      {
+        MessageBox.Show(validationError, "Translation error",
+          MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
       }
+
+      int factoryNameIndex = factorySection.CommonTable.GetHeaderIndex("Name");
+      int productNameIndex = productSection.CommonTable.GetHeaderIndex("Name");
+      ApplyNameTranslations(factorySection.CommonTable, factoryNameIndex, factoryIds, factoryNames);
+      ApplyNameTranslations(productSection.CommonTable, productNameIndex, productIds, productNames);
+
+      TreeViewSection.SelectedNode = null;
+      ReloadSectionsTree();
+      DataGridSection.Rows.Clear();
+      DataGridSection.Columns.Clear();
+      TableItemsGrid.Rows.Clear();
+      TableItemsGrid.Columns.Clear();
+      AllItemsCmbBx.Items.Clear();
+      selectedCommonTable = null;
+      selectedSectionName = "";
+      DetailsLbl.Text = "N/A";
+
+      MessageBox.Show("Factory and product names were translated successfully.",
+        "Translation complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    bool CanApplyNameTranslations(ConfigSection section, string[] itemIds,
+      string[] translatedNames, out string error)
+    {
+      if (section == null || section.CommonTable == null)
+      {
+        error = "The required Factory or Product section is missing.";
+        return false;
+      }
+
+      if (itemIds.Length != translatedNames.Length)
+      {
+        error = section.Name + ": the translation table is invalid.";
+        return false;
+      }
+
+      if (section.CommonTable.GetHeaderIndex("Name") < 0)
+      {
+        error = section.Name + ": the Name column is missing.";
+        return false;
+      }
+
+      foreach (string itemId in itemIds)
+      {
+        if (section.CommonTable.GetRow(itemId) == null)
+        {
+          error = section.Name + ": item ID " + itemId + " is missing. No translations were applied.";
+          return false;
+        }
+      }
+
+      error = null;
+      return true;
+    }
+
+    void ApplyNameTranslations(CommonTable table, int nameIndex, string[] itemIds,
+      string[] translatedNames)
+    {
+      for (int i = 0; i < itemIds.Length; i++)
+      {
+        TableRow row = table.GetRow(itemIds[i]);
+        row.Values[nameIndex] = ReplaceTranslatedName(row.Values[nameIndex], translatedNames[i]);
+      }
+    }
+
+    static string ReplaceTranslatedName(string originalValue, string translatedName)
+    {
+      string escapedName = translatedName.Replace("\\", "\\\\").Replace("\"", "\\\"");
+      if (String.IsNullOrEmpty(originalValue))
+        return "\"" + escapedName + "\" \"\"";
+
+      int openingQuote = originalValue.IndexOf('"');
+      int closingQuote = openingQuote < 0 ? -1 : originalValue.IndexOf('"', openingQuote + 1);
+      if (openingQuote < 0 || closingQuote < 0)
+        return "\"" + escapedName + "\" \"\"";
+
+      return originalValue.Substring(0, openingQuote) + "\"" + escapedName + "\"" +
+        originalValue.Substring(closingQuote + 1);
     }
 
     private void SetValueBtn_Click(object sender, EventArgs e)
@@ -907,8 +1238,12 @@ namespace TGConfigEditor
       {
         for (int i = 0; i < DataGridSection.SelectedCells.Count; i++)
         {
-          DataGridSection.SelectedCells[i].Value = CustomValueTxtBx.Text;
-          UpdateSourceData(CustomValueTxtBx.Text, DataGridSection.SelectedCells[i].RowIndex, DataGridSection.SelectedCells[i].ColumnIndex);
+          DataGridViewCell cell = DataGridSection.SelectedCells[i];
+          if (cell.ReadOnly)
+            continue;
+
+          cell.Value = CustomValueTxtBx.Text;
+          UpdateSourceData(CustomValueTxtBx.Text, cell.RowIndex, cell.ColumnIndex);
         }
       }
     }
@@ -917,12 +1252,37 @@ namespace TGConfigEditor
     {
       if (DataGridSection != null && DataGridSection.SelectedCells.Count > 0)
       {
-        for (int i = 0; i < DataGridSection.SelectedCells.Count; i++)
+        double percentage;
+        if (!TryParseConfigNumber(CustomValueTxtBx.Text, out percentage))
         {
-          int value = Convert.ToInt32(DataGridSection.SelectedCells[i].Value);
-          int percentage = Convert.ToInt32(CustomValueTxtBx.Text);
-          DataGridSection.SelectedCells[i].Value = value + (value * (percentage / 100.0));
-          UpdateSourceData(CustomValueTxtBx.Text, DataGridSection.SelectedCells[i].RowIndex, DataGridSection.SelectedCells[i].ColumnIndex);
+          MessageBox.Show("Enter a valid percentage.", "Invalid value",
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+          return;
+        }
+
+        List<DataGridViewCell> editableCells = DataGridSection.SelectedCells
+          .Cast<DataGridViewCell>().Where(cell => !cell.ReadOnly).ToList();
+        List<double> sourceValues = new List<double>();
+
+        foreach (DataGridViewCell cell in editableCells)
+        {
+          double value;
+          if (cell.Value == null || !TryParseConfigNumber(cell.Value.ToString(), out value))
+          {
+            MessageBox.Show("One of the selected cells is not numeric.", "Invalid value",
+              MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+          }
+          sourceValues.Add(value);
+        }
+
+        for (int i = 0; i < editableCells.Count; i++)
+        {
+          DataGridViewCell cell = editableCells[i];
+          double newValue = sourceValues[i] + (sourceValues[i] * (percentage / 100.0));
+          string formattedValue = newValue.ToString("G15", CultureInfo.InvariantCulture);
+          cell.Value = formattedValue;
+          UpdateSourceData(formattedValue, cell.RowIndex, cell.ColumnIndex);
         }
       }
     }
