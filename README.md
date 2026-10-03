@@ -26,6 +26,8 @@ There is AI generated code inside.
 
 **Overwrite the original file. Done! The game will generate all map sizes.**
 
+You can download the file from release of from source code. Archive name: FE_RandomMap.zip
+
 ### HISTORY OF THIS BUG
 
 The Steam version contains an incorrectly configured `uif/uif/FE_RandomMap.uif` file. Although the menu displays the correct map-size options—Small, Normal, Large, and Huge—the buttons were connected to the wrong callback functions.
