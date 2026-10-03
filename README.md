@@ -2,7 +2,7 @@
 
 Transport Giant Config Editor allows you to edit main game config file. 
 For fans! You can really change that game with this extra options! Enjoy!
-
+Current version is v0.6.0.0
 
 
 ## Features
