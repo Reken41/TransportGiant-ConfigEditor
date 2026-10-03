@@ -19,6 +19,9 @@ namespace TGConfigEditor
 
     public CommonTable GetTable(string itemId)
     {
+      if (String.IsNullOrEmpty(itemId))
+        return null;
+
       foreach (CommonTable table in CommonTables)
       {
         if (table.ItemId == itemId)

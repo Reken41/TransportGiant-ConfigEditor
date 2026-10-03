@@ -15,15 +15,21 @@ namespace TGConfigEditor
     public string TableComment { get; set; }
     public List<TableRow> Rows { get; set; }
     public List<string> ColumnsHeaders { get; set; }
+    public int RawHeaderLineIndex { get; set; }
+    public bool IsDirty { get; set; }
 
     public CommonTable()
     {
       Rows = new List<TableRow>();
       ColumnsHeaders = new List<string>();
+      RawHeaderLineIndex = -1;
     }
 
     public TableRow GetRow(string itemId)
     {
+      if (String.IsNullOrEmpty(itemId))
+        return null;
+
       foreach (TableRow row in Rows)
       {
         if (row.ItemId == itemId)
@@ -34,6 +40,9 @@ namespace TGConfigEditor
 
     public int GetHeaderIndex(string headerName)
     {
+      if (String.IsNullOrEmpty(headerName))
+        return -1;
+
       for (int i = 0; i < ColumnsHeaders.Count; i++)
       {
         if (ColumnsHeaders[i] == headerName)

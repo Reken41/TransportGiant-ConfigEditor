@@ -10,10 +10,12 @@ namespace TGConfigEditor
   {
     public string ItemId { get; set; }
     public List<string> Values { get; set; }
+    public int RawLineIndex { get; set; }
 
     public TableRow()
     {
       Values = new List<string>();
+      RawLineIndex = -1;
     }
   }
 }

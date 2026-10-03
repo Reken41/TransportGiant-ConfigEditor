@@ -27,6 +27,14 @@ namespace TGConfigEditor
       }
     }
 
+    public string Text
+    {
+      get
+      {
+        return _text;
+      }
+    }
+
     //Override ToString method
     public override string ToString()
     {

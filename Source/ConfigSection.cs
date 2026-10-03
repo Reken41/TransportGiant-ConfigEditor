@@ -11,6 +11,7 @@ namespace TGConfigEditor
     public string Name { get; set; }
     public bool IsSupported { get; set; }
     public bool IsMasterTable { get; set; }
+    public bool IsDirty { get; set; }
     public List<string> RawLines { get; set; }
 
     public MasterTable MasterTable { get; set; }

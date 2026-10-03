@@ -26,6 +26,9 @@ namespace TGConfigEditor
 
     public static bool IsSectionSupported(ConfigSection section)
     {
+      if (section == null || String.IsNullOrEmpty(section.Name))
+        return false;
+
       foreach (string name in GameData.SupportedSections)
       {
         if (section.Name == name)
@@ -37,11 +40,15 @@ namespace TGConfigEditor
 
     public static bool IsSectionMasterTable(ConfigSection section)
     {
-      return section.RawLines[0].Contains("MASTER_TABLE");
+      return section != null && section.RawLines != null && section.RawLines.Count > 0 &&
+        section.RawLines[0] != null && section.RawLines[0].Contains("MASTER_TABLE");
     }
 
     public static string ClearDoubleSpaces(string input)
     {
+      if (input == null)
+        return String.Empty;
+
       while (input.Contains("  "))
         input = input.Replace("  ", " ");
       return input;
@@ -49,6 +56,9 @@ namespace TGConfigEditor
 
     public static string NormalizeLine(string line)
     {
+      if (line == null)
+        return String.Empty;
+
       line = line.Trim();
       //line = line.Replace("\t", " ");
       line = ClearDoubleSpaces(line);
@@ -57,6 +67,9 @@ namespace TGConfigEditor
 
     public static string NormalizeText(string text)
     {
+      if (text == null)
+        return String.Empty;
+
       text = text.Trim();
       text = text.Replace("\t", " ");
       text = text.Replace("\\", "");

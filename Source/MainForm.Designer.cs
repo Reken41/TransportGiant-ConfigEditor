@@ -351,7 +351,7 @@
       this.Icon = ((System.Drawing.Icon)(resources.GetObject("$this.Icon")));
       this.Margin = new System.Windows.Forms.Padding(2);
       this.Name = "MainForm";
-      this.Text = "Transport Giant - Config editor v0.5";
+      this.Text = "Transport Giant - Config editor v0.6";
       this.Load += new System.EventHandler(this.MainForm_Load);
       ((System.ComponentModel.ISupportInitialize)(this.DataGridSection)).EndInit();
       ((System.ComponentModel.ISupportInitialize)(this.TableItemsGrid)).EndInit();
